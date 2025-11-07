@@ -13,10 +13,12 @@ const NOME_PLANILHA_PRINCIPAL = 'Sheet1'; // Nome da planilha principal em 'eleg
 const NOME_PLANILHA_RELACIONAMENTO = 'C6 - Relacionamento';
 const NOME_PLANILHA_SUPERVISORES = 'supervisores';
 
+let serverLogs = []; // Array para armazenar logs do servidor
+
 // Função para registrar logs
 const log = (message) => {
     console.log(message);
-    // Em um cenário real, você enviaria isso para o front-end via WebSockets
+    serverLogs.push(message); // Armazena o log para enviar ao front-end
 };
 
 // Função para verificar se os arquivos necessários existem
@@ -51,6 +53,12 @@ function runAutomation() {
             return newRow;
         });
 
+        // **CORREÇÃO CRÍTICA**: Renomeia os cabeçalhos das novas colunas IMEDIATAMENTE.
+        const headerRow = dataComNovasColunas[0];
+        headerRow[2] = 'fase';
+        headerRow[3] = 'responsável';
+        headerRow[4] = 'Supervisor';
+
         const elegiveisAutoWb = xlsx.utils.book_new();
         const elegiveisAutoWs = xlsx.utils.aoa_to_sheet(dataComNovasColunas, { cellDates: true });
         xlsx.utils.book_append_sheet(elegiveisAutoWb, elegiveisAutoWs, NOME_PLANILHA_PRINCIPAL);
@@ -60,15 +68,22 @@ function runAutomation() {
         log(`Lendo ${ARQUIVO_BITRIX}...`);
         const bitrixWb = xlsx.readFile(ARQUIVO_BITRIX);
         const bitrixWs = bitrixWb.Sheets[bitrixWb.SheetNames[0]];
-        const bitrixData = xlsx.utils.sheet_to_json(bitrixWs); // Lê usando a primeira linha como cabeçalho
+        // Lê os dados como uma matriz para usar os índices das colunas diretamente
+        const bitrixData = xlsx.utils.sheet_to_json(bitrixWs, { header: 1 }); 
 
-        // Encontra os nomes reais dos cabeçalhos
-        const bitrixHeaders = Object.keys(bitrixData[0] || {});
-        const hCnpj = bitrixHeaders.find(h => h.toUpperCase().includes('CNPJ'));
-        const hFase = bitrixHeaders.find(h => h.toUpperCase().includes('Fase'));
-        const hResponsavel = bitrixHeaders.find(h => h.toUpperCase().includes('Responsável'));
+        // Pega os índices das colunas especificadas (B=1, E=4, H=7)
+        const colIndexCnpj = xlsx.utils.decode_col('H');
+        const colIndexFase = xlsx.utils.decode_col('B');
+        const colIndexResponsavel = xlsx.utils.decode_col('E');
 
-        const bitrixColunas = bitrixData.map(row => [row[hCnpj], row[hFase], row[hResponsavel]]);
+        // Extrai as colunas CNPJ (H), Fase (B) e Responsável (E), incluindo o cabeçalho
+        const bitrixColunasData = bitrixData.slice(1).map((row) => [ // .slice(1) para pular o cabeçalho original
+            row[colIndexCnpj], 
+            row[colIndexFase], 
+            row[colIndexResponsavel]
+        ]);
+        const bitrixColunas = [['CNPJ', 'Fase', 'Responsavel'], ...bitrixColunasData]; // Adiciona o cabeçalho padronizado no início
+
         const relacionamentoWs = xlsx.utils.aoa_to_sheet(bitrixColunas);
         xlsx.utils.book_append_sheet(elegiveisAutoWb, relacionamentoWs, NOME_PLANILHA_RELACIONAMENTO);
         log(`Planilha "${NOME_PLANILHA_RELACIONAMENTO}" adicionada.`);
@@ -79,48 +94,20 @@ function runAutomation() {
         const timeData = xlsx.utils.sheet_to_json(timeWs); // Lê usando a primeira linha como cabeçalho
         
         const timeHeaders = Object.keys(timeData[0] || {});
-        const hConsultor = timeHeaders.find(h => h.toUpperCase().includes('Consultor'));
+        const hConsultor = timeHeaders.find(h => h.toUpperCase().includes('CONSULTOR'));
         const hEquipe = timeHeaders.find(h => h.toUpperCase().includes('EQUIPE'));
 
-        const timeColunas = timeData.map(row => [row[hConsultor], row[hEquipe]]);
+        // Extrai os dados e adiciona a linha de cabeçalho manualmente
+        let timeColunas = timeData.map(row => [row[hConsultor] || '', row[hEquipe] || '']); // Garante que valores nulos sejam strings vazias
+        timeColunas.unshift(['Consultor', 'Equipe']); // Adiciona o cabeçalho no início do array
+
         const supervisoresWs = xlsx.utils.aoa_to_sheet(timeColunas);
         xlsx.utils.book_append_sheet(elegiveisAutoWb, supervisoresWs, NOME_PLANILHA_SUPERVISORES);
         log(`Planilha "${NOME_PLANILHA_SUPERVISORES}" adicionada.`);
 
-        // --- Passo 7: Fórmulas PROCV (VLOOKUP) ---
-        log('Aplicando fórmulas PROCV...');
-        const mainSheetData = xlsx.utils.sheet_to_json(elegiveisAutoWs, { header: 1 });
-        
-        // Define os cabeçalhos APENAS para as novas colunas inseridas
-        if (mainSheetData.length > 0) {
-            mainSheetData[0][2] = 'fase';
-            mainSheetData[0][3] = 'responsável';
-            mainSheetData[0][4] = 'Supervisor';
-            // A coluna F (índice 5) não foi solicitada para renomear, então a deixamos como está.
-        }
-
-        for (let i = 1; i < mainSheetData.length; i++) { // Começa de 1 para pular o cabeçalho
-            const rowIndex = i + 1;
-            // PROCV para Fase (Coluna C)
-            mainSheetData[i][2] = { f: `XLOOKUP(B${rowIndex},'${NOME_PLANILHA_RELACIONAMENTO}'!A:A,'${NOME_PLANILHA_RELACIONAMENTO}'!B:B)` };
-            // PROCV para Responsável (Coluna D)
-            mainSheetData[i][3] = { f: `XLOOKUP(B${rowIndex},'${NOME_PLANILHA_RELACIONAMENTO}'!A:A,'${NOME_PLANILHA_RELACIONAMENTO}'!C:C)` };
-            // PROCV para Supervisor (Coluna E)
-            mainSheetData[i][4] = { f: `XLOOKUP(D${rowIndex},'${NOME_PLANILHA_SUPERVISORES}'!A:A,'${NOME_PLANILHA_SUPERVISORES}'!B:B)` };
-        }
-
-        const wsComFormulas = xlsx.utils.aoa_to_sheet(mainSheetData);
-        elegiveisAutoWb.Sheets[NOME_PLANILHA_PRINCIPAL] = wsComFormulas;
-        
-        // Salva temporariamente para que o Excel calcule as fórmulas
-        xlsx.writeFile(elegiveisAutoWb, 'temp_calculo.xlsx');
-        const wbCalculado = xlsx.readFile('temp_calculo.xlsx', { cellFormula: false }); // Lê os valores, não as fórmulas
-        log('Fórmulas calculadas e convertidas para valores.');
-
         // --- Passo 8: Filtros e exclusão de linhas ---
         log('Aplicando filtros e removendo linhas...');
-        const wsFinal = wbCalculado.Sheets[NOME_PLANILHA_PRINCIPAL];
-        let finalData = xlsx.utils.sheet_to_json(wsFinal, { defval: null });
+        let finalData = xlsx.utils.sheet_to_json(elegiveisAutoWs, { defval: null });
         
         if (finalData.length === 0) {
             log('AVISO: A planilha principal está vazia após o cálculo das fórmulas. O arquivo final estará vazio.');
@@ -148,8 +135,8 @@ function runAutomation() {
         const headers = Object.keys(finalData[0]);
         const colElegivel = findHeader(headers, 'FL_ELEGIVEL_VENDA_C6PAY', 'AK');
         const colTipoPessoa = findHeader(headers, 'TIPO_PESSOA', 'H');
-        const colDataAprovacao = findHeader(headers, 'DT_APROVACAO_PAY', 'AM'); // Usando AK como fallback, conforme prompt anterior
-        const colStatusCC = findHeader(headers, 'STATUS_CC', 'Y');
+        const colDataAprovacao = findHeader(headers, 'DT_APROVACAO_PAY', 'AK'); // Usando AK como fallback, conforme prompt anterior
+        const colStatusCC = findHeader(headers, 'STATUS_CC', 'Y'); //
         
         if (!colElegivel || !colTipoPessoa || !colDataAprovacao || !colStatusCC) {
             // O log de erro agora será mais específico sobre qual coluna falhou
@@ -167,21 +154,74 @@ function runAutomation() {
         const filtro3 = filtro2.filter(row => row[colDataAprovacao] === null || row[colDataAprovacao] === '');
         log(`Linhas restantes após filtro data_aprovação_pay = vazias: ${filtro3.length}`);
 
-        const dadosFiltrados = filtro3.filter(row => row[colStatusCC] === 'LIBERADA');
+        const dadosFiltrados = filtro3.filter(row => String(row[colStatusCC]).toUpperCase() === 'LIBERADA'); //
         log(`Linhas restantes após filtro STATUS_CC = "LIBERADA": ${dadosFiltrados.length}`);
 
         log(`${dadosFiltrados.length} linhas restantes no resultado final.`);
 
-        // --- Final: Salvar o arquivo final ---
-        if (dadosFiltrados.length === 0) {
-            log('AVISO: Nenhum dado correspondeu a todos os critérios de filtro. O arquivo final terá apenas cabeçalhos.');
+        // --- Passo 7: Lógica de PROCV em etapas separadas ---
+        log('Iniciando buscas PROCV em etapas para garantir a ordem de cálculo...');
+
+        // Prepara os dados filtrados para receber as fórmulas.
+        // Converte o JSON de volta para um array de arrays (aoa) para manipulação de células.
+        let dadosParaProcv = [Object.keys(dadosFiltrados[0] || {}), ...dadosFiltrados.map(Object.values)];
+
+        // Cria a pasta de trabalho que será usada para os cálculos.
+        const wbParaCalculo = xlsx.utils.book_new();
+        // Adiciona as planilhas de dependência (lookups) desde o início.
+        xlsx.utils.book_append_sheet(wbParaCalculo, relacionamentoWs, NOME_PLANILHA_RELACIONAMENTO);
+        xlsx.utils.book_append_sheet(wbParaCalculo, supervisoresWs, NOME_PLANILHA_SUPERVISORES);
+
+        // ETAPA 1: Aplicar PROCV para 'fase' e 'responsável'.
+        log("Etapa 1: Aplicando fórmulas para 'fase' e 'responsável'...");
+        for (let i = 1; i < dadosParaProcv.length; i++) { // Começa em 1 para pular o cabeçalho
+            const rowIndex = i + 1; // O índice da linha no Excel é baseado em 1 e inclui o cabeçalho.
+            dadosParaProcv[i][2] = { f: `IFERROR(VLOOKUP(B${rowIndex},'${NOME_PLANILHA_RELACIONAMENTO}'!A:B,2,FALSE),"Não encontrado")` };
+            dadosParaProcv[i][3] = { f: `IFERROR(VLOOKUP(B${rowIndex},'${NOME_PLANILHA_RELACIONAMENTO}'!A:C,3,FALSE),"Não encontrado")` };
+        }
+        
+        // Adiciona a planilha principal com as fórmulas da Etapa 1.
+        const wsComFormulas1 = xlsx.utils.aoa_to_sheet(dadosParaProcv);
+        xlsx.utils.book_append_sheet(wbParaCalculo, wsComFormulas1, NOME_PLANILHA_PRINCIPAL);
+        
+        // Força o cálculo das fórmulas escrevendo e lendo o buffer na memória.
+        const buffer1 = xlsx.write(wbParaCalculo, { type: 'buffer', bookType: 'xlsx' });
+        const wbCalculado1 = xlsx.read(buffer1, { type: 'buffer', cellFormula: false });
+        const wsCalculado1 = wbCalculado1.Sheets[NOME_PLANILHA_PRINCIPAL];
+        const dadosCalculados1 = xlsx.utils.sheet_to_json(wsCalculado1, { header: 1 });
+        log("Etapa 1: Valores de 'fase' e 'responsável' calculados.");
+
+        // ETAPA 2: Aplicar PROCV para 'Supervisor' usando os dados calculados da Etapa 1.
+        log("Etapa 2: Aplicando fórmulas para 'Supervisor'...");
+        for (let i = 1; i < dadosCalculados1.length; i++) { // Começa em 1 para pular o cabeçalho
+            const rowIndex = i + 1;
+            dadosCalculados1[i][4] = { f: `IFERROR(VLOOKUP(D${rowIndex},'${NOME_PLANILHA_SUPERVISORES}'!A:B,2,FALSE),"Não encontrado")` };
         }
 
-        const finalWsComFiltro = xlsx.utils.json_to_sheet(dadosFiltrados);
-        wbCalculado.Sheets[NOME_PLANILHA_PRINCIPAL] = finalWsComFiltro;
+        // Atualiza a planilha principal na pasta de trabalho já existente com as novas fórmulas.
+        wbParaCalculo.Sheets[NOME_PLANILHA_PRINCIPAL] = xlsx.utils.aoa_to_sheet(dadosCalculados1);
         
-        xlsx.writeFile(wbCalculado, ARQUIVO_ELEGIVEIS);
-        fs.unlinkSync('temp_calculo.xlsx'); // Remove o arquivo temporário
+        // Força o cálculo final usando a mesma técnica de buffer.
+        const buffer2 = xlsx.write(wbParaCalculo, { type: 'buffer', bookType: 'xlsx' });
+        const wbCalculadoFinal = xlsx.read(buffer2, { type: 'buffer', cellFormula: false });
+        const finalCalculatedData = xlsx.utils.sheet_to_json(wbCalculadoFinal.Sheets[NOME_PLANILHA_PRINCIPAL], { header: 1 });
+        log("Etapa 2: Valores de 'Supervisor' calculados.");
+
+        // Os dados em 'finalCalculatedData' já estão no formato de array de arrays, incluindo o cabeçalho.
+        const finalDataRows = finalCalculatedData.slice(1); // Pega apenas as linhas de dados
+
+        // --- Final: Salvar o arquivo final ---
+        const finalWb = xlsx.utils.book_new();
+        // Reutiliza as planilhas já calculadas do workbook final.
+        xlsx.utils.book_append_sheet(finalWb, wbCalculadoFinal.Sheets[NOME_PLANILHA_PRINCIPAL], NOME_PLANILHA_PRINCIPAL);
+        xlsx.utils.book_append_sheet(finalWb, wbCalculadoFinal.Sheets[NOME_PLANILHA_RELACIONAMENTO], NOME_PLANILHA_RELACIONAMENTO);
+        xlsx.utils.book_append_sheet(finalWb, wbCalculadoFinal.Sheets[NOME_PLANILHA_SUPERVISORES], NOME_PLANILHA_SUPERVISORES);
+
+        if (finalDataRows.length === 0 && dadosFiltrados.length > 0) {
+            log('AVISO: Nenhum dado restou após todos os processos. O arquivo final pode estar vazio ou conter apenas cabeçalhos.');
+        }
+
+        xlsx.writeFile(finalWb, ARQUIVO_ELEGIVEIS);
         log(`Processo concluído! Arquivo "${ARQUIVO_ELEGIVEIS}" salvo com sucesso.`);
 
     } catch (error) {
@@ -193,9 +233,10 @@ function runAutomation() {
 // Servidor HTTP simples para servir a página HTML
 const server = http.createServer((req, res) => {
     if (req.method === 'POST' && req.url === '/run') {
-        runAutomation();
+        serverLogs = []; // Limpa os logs antigos a cada nova execução
+        runAutomation(); //
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ message: 'Processo iniciado. Verifique o console do servidor para logs.' }));
+        res.end(JSON.stringify({ message: 'Processo concluído.', logs: serverLogs })); // Envia todos os logs para o cliente
     } else {
         fs.readFile(path.join(__dirname, 'index.html'), (err, data) => {
             if (err) {

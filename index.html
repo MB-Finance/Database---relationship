@@ -40,9 +40,13 @@
             logToPage('Enviando requisição para iniciar o processo...');
             try {
                 const response = await fetch('/run', { method: 'POST' });
-                const result = await response.json();
-                logToPage('Resposta do servidor: ' + result.message);
-                logToPage('<b>Processo concluído! Verifique o arquivo "elegiveis_auto.xlsx".</b>');
+                const result = await response.json(); //
+                logToPage('--- Resposta do Servidor ---'); //
+                if (result.logs && result.logs.length > 0) { //
+                    result.logs.forEach(logMsg => logToPage(logMsg)); //
+                } //
+                logToPage('---------------------------'); //
+                logToPage('<b>' + result.message + ' Verifique o arquivo "elegiveis_auto.xlsx".</b>'); //
             } catch (error) {
                 logToPage('Erro ao se comunicar com o servidor: ' + error.message);
             }
