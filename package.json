@@ -1,0 +1,23 @@
+{
+  "name": "database---relationship",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MB-Finance/Database---relationship.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/MB-Finance/Database---relationship/issues"
+  },
+  "homepage": "https://github.com/MB-Finance/Database---relationship#readme",
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  }
+}

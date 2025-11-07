@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Automação de Planilhas</title>
+    <style>
+        body { font-family: sans-serif; background-color: #f4f4f4; color: #333; padding: 20px; }
+        h1 { color: #0056b3; }
+        #container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        button { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
+        button:hover { background-color: #0056b3; }
+        #logs { margin-top: 20px; background-color: #eee; border: 1px solid #ddd; padding: 10px; height: 300px; overflow-y: scroll; font-family: monospace; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <h1>Automação de Planilhas</h1>
+        <p>
+            Certifique-se de que os seguintes arquivos estão na mesma pasta que o servidor:
+            <code>relatorio.xlsx</code>, <code>baixada_do_bitrix.xlsx</code>, <code>time_novembro.xlsx</code>.
+        </p>
+        <button onclick="startProcess()">Iniciar Processo</button>
+        <h2>Logs do Processo (no console do servidor)</h2>
+        <div id="logs">
+            Os logs detalhados aparecerão no terminal onde você iniciou o 'server.js'.<br>
+            Esta área é apenas para feedback visual.
+        </div>
+    </div>
+
+    <script>
+        const logDiv = document.getElementById('logs');
+
+        function logToPage(message) {
+            logDiv.innerHTML += message + '<br>';
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        async function startProcess() {
+            logToPage('Enviando requisição para iniciar o processo...');
+            try {
+                const response = await fetch('/run', { method: 'POST' });
+                const result = await response.json();
+                logToPage('Resposta do servidor: ' + result.message);
+                logToPage('<b>Processo concluído! Verifique o arquivo "elegiveis_auto.xlsx".</b>');
+            } catch (error) {
+                logToPage('Erro ao se comunicar com o servidor: ' + error.message);
+            }
+        }
+    </script>
+</body>
+</html>
