@@ -1,258 +1,505 @@
+/**
+ * app.js
+ *
+ * Script unificado:
+ * - Roda como servidor HTTP (porta 3000). POST /run -> executa pipeline completo (ler relatorio.xlsx, bitrix, time, gerar elegiveis_auto.xlsx).
+ * - Também oferece modo "procv-only" (se existir elegiveis_auto.xlsx ele gera relatorio_final.xlsx) quando executado diretamente (node app.js).
+ *
+ * Dependências:
+ *   npm install xlsx
+ *
+ * Coloque os arquivos na mesma pasta:
+ *   - relatorio.xlsx
+ *   - baixada_do_bitrix.xlsx
+ *   - time_novembro.xlsx
+ *   (ou apenas elegiveis_auto.xlsx caso queira só o passo PROCV-only)
+ *
+ * Execução:
+ *   node app.js        -> roda em modo CLI: se achar elegiveis_auto.xlsx executa PROCV-only; senão executa pipeline completo (se tiver os arquivos).
+ *   Start server: node app.js && abrir http://localhost:3000 e clicar/run POST -> chama pipeline completo.
+ */
+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const xlsx = require('xlsx');
 
-// Nomes dos arquivos e planilhas (ajuste se necessário)
+// ---------- CONFIGURAÇÃO DE ARQUIVOS ----------
 const ARQUIVO_RELATORIO = 'relatorio.xlsx';
 const ARQUIVO_ELEGIVEIS = 'elegiveis_auto.xlsx';
 const ARQUIVO_BITRIX = 'baixada_do_bitrix.xlsx';
 const ARQUIVO_TIME = 'time_novembro.xlsx';
 
-const NOME_PLANILHA_PRINCIPAL = 'Sheet1'; // Nome da planilha principal em 'elegiveis_auto'
+const ARQUIVO_SAIDA_PROCV = 'relatorio_final.xlsx';
+
+const NOME_PLANILHA_PRINCIPAL = 'Sheet1'; // planilha principal que criamos
 const NOME_PLANILHA_RELACIONAMENTO = 'C6 - Relacionamento';
 const NOME_PLANILHA_SUPERVISORES = 'supervisores';
 
-let serverLogs = []; // Array para armazenar logs do servidor
-
-// Função para registrar logs
-const log = (message) => {
-    console.log(message);
-    serverLogs.push(message); // Armazena o log para enviar ao front-end
+// ---------- LOGS ----------
+let serverLogs = [];
+const log = (msg) => {
+    const texto = `[${new Date().toISOString()}] ${msg}`;
+    console.log(texto);
+    serverLogs.push(texto);
 };
 
-// Função para verificar se os arquivos necessários existem
-function checkRequiredFiles() {
+// ---------- UTILITÁRIOS DE NORMALIZAÇÃO ----------
+const norm = v => (v === null || v === undefined) ? '' : String(v).trim();
+const normKey = v => norm(v).toUpperCase();
+const normCnpjKey = v => norm(v).replace(/\D/g, ''); // mantém só números
+
+// ---------- FUNÇÃO: CHECAR EXISTÊNCIA ARQUIVOS (para pipeline completo) ----------
+function checkRequiredFilesForPipeline() {
     const files = [ARQUIVO_RELATORIO, ARQUIVO_BITRIX, ARQUIVO_TIME];
-    for (const file of files) {
-        if (!fs.existsSync(file)) {
-            throw new Error(`Arquivo necessário não encontrado: ${file}`);
+    for (const f of files) {
+        if (!fs.existsSync(f)) {
+            log(`Arquivo necessário não encontrado: ${f}`);
+            return false;
         }
     }
-    log('Todos os arquivos de entrada foram encontrados.');
     return true;
 }
 
-// Função principal da automação
-function runAutomation() {
+// ---------- FUNÇÃO: PIPELINE COMPLETO (gera elegiveis_auto.xlsx com colunas preenchidas) ----------
+function runFullPipeline() {
+    serverLogs = []; // reset logs para execução
     try {
-        log('Iniciando automação...');
-        // --- Passo 0: Verificar arquivos ---
-        checkRequiredFiles();
+        log('Iniciando pipeline completo...');
 
-        // --- Passo 1 e 2: Copiar relatório e adicionar colunas ---
+        if (!checkRequiredFilesForPipeline()) {
+            log('Faltam arquivos para executar o pipeline completo. Abortando pipeline.');
+            return { success: false, logs: serverLogs };
+        }
+
+        // --- Ler relatorio.xlsx ---
         log(`Lendo ${ARQUIVO_RELATORIO}...`);
-        const relatorioWb = xlsx.readFile(ARQUIVO_RELATORIO);
-        const relatorioWs = relatorioWb.Sheets[relatorioWb.SheetNames[0]];
-        const dataRelatorio = xlsx.utils.sheet_to_json(relatorioWs, { header: 1, defval: null });
+        const relWb = xlsx.readFile(ARQUIVO_RELATORIO);
+        const relFirstSheet = relWb.Sheets[relWb.SheetNames[0]];
+        const relDataAoA = xlsx.utils.sheet_to_json(relFirstSheet, { header: 1, defval: null });
 
-        log('Adicionando colunas em branco em C, D, E, F...');
-        const dataComNovasColunas = dataRelatorio.map(row => {
+        if (relDataAoA.length === 0) {
+            log('Relatório vazio. Abortando.');
+            return { success: false, logs: serverLogs };
+        }
+
+        // --- Inserir 4 colunas em branco a partir da coluna C (índice 2) ---
+        log('Inserindo 4 colunas em branco (C, D, E, F) e renomeando cabeçalhos...');
+        const dataComNovasColunas = relDataAoA.map((row, rowIndex) => {
             const newRow = [...row];
-            newRow.splice(2, 0, null, null, null, null); // Insere 4 valores nulos a partir do índice 2 (Coluna C)
+            // garante que tenha ao menos 2 posições para inserir no índice 2
+            while (newRow.length < 2) newRow.push(null);
+            newRow.splice(2, 0, null, null, null, null);
             return newRow;
         });
 
-        // **CORREÇÃO CRÍTICA**: Renomeia os cabeçalhos das novas colunas IMEDIATAMENTE.
+        // renomeia cabeçalhos das novas colunas imediatamente
         const headerRow = dataComNovasColunas[0];
         headerRow[2] = 'fase';
-        headerRow[3] = 'responsável';
+        headerRow[3] = 'responsavel';
         headerRow[4] = 'Supervisor';
+        // se quiser manter outros cabeçalhos, não mexa; já renomeamos essas 3
 
-        const elegiveisAutoWb = xlsx.utils.book_new();
-        const elegiveisAutoWs = xlsx.utils.aoa_to_sheet(dataComNovasColunas, { cellDates: true });
-        xlsx.utils.book_append_sheet(elegiveisAutoWb, elegiveisAutoWs, NOME_PLANILHA_PRINCIPAL);
-        log('Planilha principal de "elegiveis_auto" criada na memória.');
+        // --- Montar workbook inicial 'elegiveis_auto' em memória com a planilha principal ---
+        const elegiveisWb = xlsx.utils.book_new();
+        const elegiveisWs = xlsx.utils.aoa_to_sheet(dataComNovasColunas, { cellDates: true });
+        xlsx.utils.book_append_sheet(elegiveisWb, elegiveisWs, NOME_PLANILHA_PRINCIPAL);
+        log('Planilha principal criada em memória.');
 
-        // --- Passo 3, 4, 5, 6: Processar planilhas de apoio ---
-        log(`Lendo ${ARQUIVO_BITRIX}...`);
+        // --- Ler Bitrix --- (extraindo CNPJ (coluna H), Fase (B), Responsável (E))
+        log(`Lendo ${ARQUIVO_BITRIX} (Bitrix)...`);
         const bitrixWb = xlsx.readFile(ARQUIVO_BITRIX);
         const bitrixWs = bitrixWb.Sheets[bitrixWb.SheetNames[0]];
-        // Lê os dados como uma matriz para usar os índices das colunas diretamente
-        const bitrixData = xlsx.utils.sheet_to_json(bitrixWs, { header: 1 }); 
+        const bitrixDataAoA = xlsx.utils.sheet_to_json(bitrixWs, { header: 1, defval: null });
 
-        // Pega os índices das colunas especificadas (B=1, E=4, H=7)
-        const colIndexCnpj = xlsx.utils.decode_col('H');
-        const colIndexFase = xlsx.utils.decode_col('B');
-        const colIndexResponsavel = xlsx.utils.decode_col('E');
+        // Pegar índices por letras (B=1, E=4, H=7)
+        const idxB = xlsx.utils.decode_col('B');
+        const idxE = xlsx.utils.decode_col('E');
+        const idxH = xlsx.utils.decode_col('H');
 
-        // Extrai as colunas CNPJ (H), Fase (B) e Responsável (E), incluindo o cabeçalho
-        const bitrixColunasData = bitrixData.slice(1).map((row) => [ // .slice(1) para pular o cabeçalho original
-            row[colIndexCnpj], 
-            row[colIndexFase], 
-            row[colIndexResponsavel]
-        ]);
-        const bitrixColunas = [['CNPJ', 'Fase', 'Responsavel'], ...bitrixColunasData]; // Adiciona o cabeçalho padronizado no início
+        // Extrair dados e montar bitrixColunas com cabeçalho padronizado
+        const bitrixRows = [];
+        bitrixRows.push(['CNPJ', 'Fase', 'Responsavel']);
+        for (let i = 1; i < bitrixDataAoA.length; i++) { // pula cabeçalho original
+            const r = bitrixDataAoA[i];
+            const cnpjVal = r[idxH];
+            const faseVal = r[idxB];
+            const respVal = r[idxE];
+            // se quiser filtrar linhas sem CNPJ, pode pular
+            if (cnpjVal === null || cnpjVal === undefined || String(cnpjVal).trim() === '') continue;
+            bitrixRows.push([cnpjVal, faseVal, respVal]);
+        }
+        const relacionamentoWs = xlsx.utils.aoa_to_sheet(bitrixRows);
+        xlsx.utils.book_append_sheet(elegiveisWb, relacionamentoWs, NOME_PLANILHA_RELACIONAMENTO);
+        log(`Planilha "${NOME_PLANILHA_RELACIONAMENTO}" adicionada (dados do Bitrix).`);
 
-        const relacionamentoWs = xlsx.utils.aoa_to_sheet(bitrixColunas);
-        xlsx.utils.book_append_sheet(elegiveisAutoWb, relacionamentoWs, NOME_PLANILHA_RELACIONAMENTO);
-        log(`Planilha "${NOME_PLANILHA_RELACIONAMENTO}" adicionada.`);
-
-        log(`Lendo ${ARQUIVO_TIME}...`);
+        // --- Ler Arquivo TIME (supervisores) ---
+        log(`Lendo ${ARQUIVO_TIME} (time)...`);
         const timeWb = xlsx.readFile(ARQUIVO_TIME);
         const timeWs = timeWb.Sheets[timeWb.SheetNames[0]];
-        const timeData = xlsx.utils.sheet_to_json(timeWs); // Lê usando a primeira linha como cabeçalho
-        
-        const timeHeaders = Object.keys(timeData[0] || {});
-        const hConsultor = timeHeaders.find(h => h.toUpperCase().includes('CONSULTOR'));
-        const hEquipe = timeHeaders.find(h => h.toUpperCase().includes('EQUIPE'));
+        // lê como JSON (primeira linha cabeçalho)
+        const timeDataJson = xlsx.utils.sheet_to_json(timeWs, { defval: '' });
 
-        // Extrai os dados e adiciona a linha de cabeçalho manualmente
-        let timeColunas = timeData.map(row => [row[hConsultor] || '', row[hEquipe] || '']); // Garante que valores nulos sejam strings vazias
-        timeColunas.unshift(['Consultor', 'Equipe']); // Adiciona o cabeçalho no início do array
+        // tenta detectar quais colunas são Consultor e Equipe (caso header possua variações)
+        const timeHeaders = Object.keys(timeDataJson[0] || {});
+        const hConsultor = timeHeaders.find(h => h && h.toUpperCase().includes('CONSULTOR')) || timeHeaders[0];
+        const hEquipe = timeHeaders.find(h => h && h.toUpperCase().includes('EQUIPE')) || timeHeaders[1] || timeHeaders[0];
 
-        const supervisoresWs = xlsx.utils.aoa_to_sheet(timeColunas);
-        xlsx.utils.book_append_sheet(elegiveisAutoWb, supervisoresWs, NOME_PLANILHA_SUPERVISORES);
-        log(`Planilha "${NOME_PLANILHA_SUPERVISORES}" adicionada.`);
-
-        // --- Passo 8: Filtros e exclusão de linhas ---
-        log('Aplicando filtros e removendo linhas...');
-        let finalData = xlsx.utils.sheet_to_json(elegiveisAutoWs, { defval: null });
-        
-        if (finalData.length === 0) {
-            log('AVISO: A planilha principal está vazia após o cálculo das fórmulas. O arquivo final estará vazio.');
-            xlsx.writeFile(wbCalculado, ARQUIVO_ELEGIVEIS);
-            fs.unlinkSync('temp_calculo.xlsx');
-            return;
+        // monta array com header padronizado
+        const supervisoresRows = [['Consultor', 'Equipe']];
+        for (const row of timeDataJson) {
+            supervisoresRows.push([row[hConsultor] || '', row[hEquipe] || '']);
         }
- 
-        // Função auxiliar para encontrar cabeçalhos de forma flexível
-        const findHeader = (headers, primaryName, fallbackColumnLetter) => {
-            // 1. Tenta encontrar pelo nome primário (ignorando maiúsculas/minúsculas e espaços)
-            let header = headers.find(h => h.trim().toUpperCase() === primaryName.toUpperCase());
-            if (header) return header;
+        const supervisoresWs = xlsx.utils.aoa_to_sheet(supervisoresRows);
+        xlsx.utils.book_append_sheet(elegiveisWb, supervisoresWs, NOME_PLANILHA_SUPERVISORES);
+        log(`Planilha "${NOME_PLANILHA_SUPERVISORES}" adicionada (dados de time).`);
 
-            // 2. Se não encontrar, usa a letra da coluna como fallback
+        // --- Converter a planilha principal (com as 4 colunas em branco) em JSON para filtrar conforme regras ---
+        log('Convertendo planilha principal para JSON para aplicar filtros...');
+        const elegiveisWsJson = xlsx.utils.sheet_to_json(elegiveisWs, { defval: null });
+        if (elegiveisWsJson.length === 0) {
+            log('Aviso: a planilha principal gerada está vazia. Abortando.');
+            return { success: false, logs: serverLogs };
+        }
+
+        // Função auxiliar para procurar cabeçalhos de forma flexível (com fallback por letra)
+        const findHeader = (headers, primaryName, fallbackColumnLetter) => {
+            let header = headers.find(h => h && h.trim().toUpperCase() === primaryName.toUpperCase());
+            if (header) return header;
+            // fallback por letra (se existir)
             const colIndex = xlsx.utils.decode_col(fallbackColumnLetter);
             if (headers[colIndex]) {
-                log(`AVISO: Coluna "${primaryName}" não encontrada pelo nome. Usando a coluna de fallback '${fallbackColumnLetter}' (${headers[colIndex]}).`);
+                log(`AVISO: Coluna "${primaryName}" não encontrada pelo nome. Usando fallback '${fallbackColumnLetter}' (${headers[colIndex]}).`);
                 return headers[colIndex];
             }
-
-            return null; // Não encontrou de nenhuma forma
+            return null;
         };
 
-        const headers = Object.keys(finalData[0]);
-        const colElegivel = findHeader(headers, 'FL_ELEGIVEL_VENDA_C6PAY', 'AK');
-        const colTipoPessoa = findHeader(headers, 'TIPO_PESSOA', 'H');
-        const colDataAprovacao = findHeader(headers, 'DT_APROVACAO_PAY', 'AK'); // Usando AK como fallback, conforme prompt anterior
-        const colStatusCC = findHeader(headers, 'STATUS_CC', 'Y'); //
-        
+        // pegar headers e determinar colunas para filtros (ajuste conforme seu relatorio original)
+        const headersRel = Object.keys(elegiveisWsJson[0]);
+        const colElegivel = findHeader(headersRel, 'FL_ELEGIVEL_VENDA_C6PAY', 'AK');
+        const colTipoPessoa = findHeader(headersRel, 'TIPO_PESSOA', 'H');
+        const colDataAprovacao = findHeader(headersRel, 'DT_APROVACAO_PAY', 'AK');
+        const colStatusCC = findHeader(headersRel, 'STATUS_CC', 'Y');
+
         if (!colElegivel || !colTipoPessoa || !colDataAprovacao || !colStatusCC) {
-            // O log de erro agora será mais específico sobre qual coluna falhou
-            throw new Error(`Não foi possível encontrar uma ou mais colunas de filtro, mesmo com as coordenadas de fallback. Verifique os nomes e as posições das colunas na planilha de relatório.`);
+            log('Erro: não foi possível localizar todas as colunas de filtro (com fallback). Abortando pipeline.');
+            return { success: false, logs: serverLogs };
         }
 
-        log(`Total de linhas antes do filtro: ${finalData.length}`);
+        log(`Total de linhas antes do filtro: ${elegiveisWsJson.length}`);
 
-        const filtro1 = finalData.filter(row => row[colElegivel] === 1 || row[colElegivel] === '1');
-        log(`Linhas restantes após filtro FL_ELEGIVEL_VENDA_C6PAY = "1": ${filtro1.length}`);
+        // Aplicar filtros:
+        const filtro1 = elegiveisWsJson.filter(row => row[colElegivel] === 1 || row[colElegivel] === '1');
+        log(`Após filtro FL_ELEGIVEL_VENDA_C6PAY = "1": ${filtro1.length}`);
 
-        const filtro2 = filtro1.filter(row => row[colTipoPessoa] === 'PJ');
-        log(`Linhas restantes após filtro Tipo_Pessoa = "PJ": ${filtro2.length}`);
+        const filtro2 = filtro1.filter(row => String(row[colTipoPessoa]).toUpperCase() === 'PJ');
+        log(`Após filtro TIPO_PESSOA = "PJ": ${filtro2.length}`);
 
-        const filtro3 = filtro2.filter(row => row[colDataAprovacao] === null || row[colDataAprovacao] === '');
-        log(`Linhas restantes após filtro data_aprovação_pay = vazias: ${filtro3.length}`);
+        const filtro3 = filtro2.filter(row => row[colDataAprovacao] === null || row[colDataAprovacao] === '' || typeof row[colDataAprovacao] === 'undefined');
+        log(`Após filtro DT_APROVACAO_PAY vazia: ${filtro3.length}`);
 
-        const dadosFiltrados = filtro3.filter(row => String(row[colStatusCC]).toUpperCase() === 'LIBERADA'); //
-        log(`Linhas restantes após filtro STATUS_CC = "LIBERADA": ${dadosFiltrados.length}`);
+        const dadosFiltrados = filtro3.filter(row => String(row[colStatusCC]).toUpperCase() === 'LIBERADA');
+        log(`Após filtro STATUS_CC = "LIBERADA": ${dadosFiltrados.length}`);
 
-        log(`${dadosFiltrados.length} linhas restantes no resultado final.`);
-
-        // --- Passo 7: Lógica de PROCV em etapas separadas ---
-        log('Iniciando buscas PROCV em etapas para garantir a ordem de cálculo...');
-
-        // Prepara os dados filtrados para receber as fórmulas.
-        // Converte o JSON de volta para um array de arrays (aoa) para manipulação de células.
-        let dadosParaProcv = [Object.keys(dadosFiltrados[0] || {}), ...dadosFiltrados.map(Object.values)];
-
-        // Cria a pasta de trabalho que será usada para os cálculos.
-        const wbParaCalculo = xlsx.utils.book_new();
-        // Adiciona as planilhas de dependência (lookups) desde o início.
-        xlsx.utils.book_append_sheet(wbParaCalculo, relacionamentoWs, NOME_PLANILHA_RELACIONAMENTO);
-        xlsx.utils.book_append_sheet(wbParaCalculo, supervisoresWs, NOME_PLANILHA_SUPERVISORES);
-
-        // ETAPA 1: Aplicar PROCV para 'fase' e 'responsável'.
-        log("Etapa 1: Aplicando fórmulas para 'fase' e 'responsável'...");
-        for (let i = 1; i < dadosParaProcv.length; i++) { // Começa em 1 para pular o cabeçalho
-            const rowIndex = i + 1; // O índice da linha no Excel é baseado em 1 e inclui o cabeçalho.
-            dadosParaProcv[i][2] = { f: `IFERROR(VLOOKUP(B${rowIndex},'${NOME_PLANILHA_RELACIONAMENTO}'!A:B,2,FALSE),"Não encontrado")` };
-            dadosParaProcv[i][3] = { f: `IFERROR(VLOOKUP(B${rowIndex},'${NOME_PLANILHA_RELACIONAMENTO}'!A:C,3,FALSE),"Não encontrado")` };
-        }
-        
-        // Adiciona a planilha principal com as fórmulas da Etapa 1.
-        const wsComFormulas1 = xlsx.utils.aoa_to_sheet(dadosParaProcv);
-        xlsx.utils.book_append_sheet(wbParaCalculo, wsComFormulas1, NOME_PLANILHA_PRINCIPAL);
-        
-        // Força o cálculo das fórmulas escrevendo e lendo o buffer na memória.
-        const buffer1 = xlsx.write(wbParaCalculo, { type: 'buffer', bookType: 'xlsx' });
-        const wbCalculado1 = xlsx.read(buffer1, { type: 'buffer', cellFormula: false });
-        const wsCalculado1 = wbCalculado1.Sheets[NOME_PLANILHA_PRINCIPAL];
-        const dadosCalculados1 = xlsx.utils.sheet_to_json(wsCalculado1, { header: 1 });
-        log("Etapa 1: Valores de 'fase' e 'responsável' calculados.");
-
-        // ETAPA 2: Aplicar PROCV para 'Supervisor' usando os dados calculados da Etapa 1.
-        log("Etapa 2: Aplicando fórmulas para 'Supervisor'...");
-        for (let i = 1; i < dadosCalculados1.length; i++) { // Começa em 1 para pular o cabeçalho
-            const rowIndex = i + 1;
-            dadosCalculados1[i][4] = { f: `IFERROR(VLOOKUP(D${rowIndex},'${NOME_PLANILHA_SUPERVISORES}'!A:B,2,FALSE),"Não encontrado")` };
+        if (dadosFiltrados.length === 0) {
+            log('Nenhuma linha restou após os filtros. Gerando arquivo com cabeçalhos apenas.');
+            // Gerar arquivo com apenas cabeçalho caso necessário
+            const onlyHeaders = [Object.keys(elegiveisWsJson[0])];
+            const wbOnly = xlsx.utils.book_new();
+            xlsx.utils.book_append_sheet(wbOnly, xlsx.utils.aoa_to_sheet(onlyHeaders), NOME_PLANILHA_PRINCIPAL);
+            xlsx.utils.book_append_sheet(wbOnly, relacionamentoWs, NOME_PLANILHA_RELACIONAMENTO);
+            xlsx.utils.book_append_sheet(wbOnly, supervisoresWs, NOME_PLANILHA_SUPERVISORES);
+            xlsx.writeFile(wbOnly, ARQUIVO_ELEGIVEIS);
+            log(`Arquivo ${ARQUIVO_ELEGIVEIS} salvo (somente cabeçalhos).`);
+            return { success: true, logs: serverLogs };
         }
 
-        // Atualiza a planilha principal na pasta de trabalho já existente com as novas fórmulas.
-        wbParaCalculo.Sheets[NOME_PLANILHA_PRINCIPAL] = xlsx.utils.aoa_to_sheet(dadosCalculados1);
-        
-        // Força o cálculo final usando a mesma técnica de buffer.
-        const buffer2 = xlsx.write(wbParaCalculo, { type: 'buffer', bookType: 'xlsx' });
-        const wbCalculadoFinal = xlsx.read(buffer2, { type: 'buffer', cellFormula: false });
-        const finalCalculatedData = xlsx.utils.sheet_to_json(wbCalculadoFinal.Sheets[NOME_PLANILHA_PRINCIPAL], { header: 1 });
-        log("Etapa 2: Valores de 'Supervisor' calculados.");
+        // --- Montar mapas para Lookup (substitui PROCV com fórmulas) ---
+        log('Montando mapas de lookup (substituindo PROCV por lógica JS)...');
 
-        // Os dados em 'finalCalculatedData' já estão no formato de array de arrays, incluindo o cabeçalho.
-        const finalDataRows = finalCalculatedData.slice(1); // Pega apenas as linhas de dados
+        // Map do relacionamento (CNPJ -> { fase, responsavel })
+        const mapBitrix = {};
+        // bitrixRows já foi montado acima com header; slice(1)
+        for (let i = 1; i < bitrixRows.length; i++) {
+            const r = bitrixRows[i];
+            const rawCnpj = r[0];
+            if (!rawCnpj) continue;
+            const key = normCnpjKey(rawCnpj);
+            mapBitrix[key] = { fase: norm(r[1]), responsavel: norm(r[2]) };
+        }
 
-        // --- Final: Salvar o arquivo final ---
+        // Map de supervisores (Consultor -> Equipe)
+        const mapTime = {};
+        for (let i = 1; i < supervisoresRows.length; i++) {
+            const [consultorRaw, equipeRaw] = supervisoresRows[i];
+            const consultorKey = normKey(consultorRaw);
+            if (!consultorKey) continue;
+            if (!mapTime[consultorKey]) mapTime[consultorKey] = norm(equipeRaw);
+        }
+
+        // --- Preencher colunas 'fase', 'responsavel', 'Supervisor' diretamente nos dados filtrados ---
+        log('Executando lookups e preenchendo colunas nas linhas filtradas...');
+        let countCnpjNotFound = 0;
+        let countRespNotFound = 0;
+        const dadosComLookups = dadosFiltrados.map((row) => {
+            // A suposição: coluna CNPJ em seu relatorio original pode variar; vamos procurar
+            // possíveis chave 'CNPJ' (maiúsc/minúsc) no objeto row
+            const possibleCnpjKeys = Object.keys(row).filter(k => k && k.toUpperCase().includes('CNPJ'));
+            let rawCnpjValue = '';
+            if (possibleCnpjKeys.length > 0) {
+                rawCnpjValue = row[possibleCnpjKeys[0]];
+            } else {
+                // tentar por posição: se existir chave parecida
+                rawCnpjValue = row['CNPJ'] || row['cnpj'] || '';
+            }
+            const cnpjKey = normCnpjKey(rawCnpjValue);
+
+            let fase = 'Não encontrado';
+            let responsavel = 'Não encontrado';
+            let supervisor = 'Não encontrado';
+
+            if (cnpjKey && mapBitrix[cnpjKey]) {
+                fase = mapBitrix[cnpjKey].fase || 'Não encontrado';
+                responsavel = mapBitrix[cnpjKey].responsavel || 'Não encontrado';
+            } else {
+                countCnpjNotFound++;
+            }
+
+            // lookup do supervisor a partir do responsavel (consultor)
+            const respKey = normKey(responsavel);
+            if (respKey && mapTime[respKey]) {
+                supervisor = mapTime[respKey];
+            } else {
+                if (responsavel !== 'Não encontrado') countRespNotFound++;
+            }
+
+            // Retornar novo objeto com as colunas adicionadas (mantendo todas as colunas originais)
+            return {
+                ...row,
+                'fase': fase,
+                'responsavel': responsavel,
+                'Supervisor': supervisor
+            };
+        });
+
+        log(`Lookups concluídos. CNPJs não encontrados: ${countCnpjNotFound}. Responsáveis (consultor) sem supervisor: ${countRespNotFound}.`);
+
+        // --- Converter dadosComLookups para sheet (inclui cabeçalho) e salvar no arquivo elegiveis_auto.xlsx ---
+        log(`Salvando arquivo ${ARQUIVO_ELEGIVEIS} com dados preenchidos...`);
+        const finalSheet = xlsx.utils.json_to_sheet(dadosComLookups, { skipHeader: false });
         const finalWb = xlsx.utils.book_new();
-        // Reutiliza as planilhas já calculadas do workbook final.
-        xlsx.utils.book_append_sheet(finalWb, wbCalculadoFinal.Sheets[NOME_PLANILHA_PRINCIPAL], NOME_PLANILHA_PRINCIPAL);
-        xlsx.utils.book_append_sheet(finalWb, wbCalculadoFinal.Sheets[NOME_PLANILHA_RELACIONAMENTO], NOME_PLANILHA_RELACIONAMENTO);
-        xlsx.utils.book_append_sheet(finalWb, wbCalculadoFinal.Sheets[NOME_PLANILHA_SUPERVISORES], NOME_PLANILHA_SUPERVISORES);
-
-        if (finalDataRows.length === 0 && dadosFiltrados.length > 0) {
-            log('AVISO: Nenhum dado restou após todos os processos. O arquivo final pode estar vazio ou conter apenas cabeçalhos.');
-        }
-
+        xlsx.utils.book_append_sheet(finalWb, finalSheet, NOME_PLANILHA_PRINCIPAL);
+        xlsx.utils.book_append_sheet(finalWb, relacionamentoWs, NOME_PLANILHA_RELACIONAMENTO);
+        xlsx.utils.book_append_sheet(finalWb, supervisoresWs, NOME_PLANILHA_SUPERVISORES);
         xlsx.writeFile(finalWb, ARQUIVO_ELEGIVEIS);
-        log(`Processo concluído! Arquivo "${ARQUIVO_ELEGIVEIS}" salvo com sucesso.`);
 
-    } catch (error) {
-        log(`Ocorreu um erro: ${error.message}`);
-        console.error(error);
+        log(`Arquivo ${ARQUIVO_ELEGIVEIS} salvo com sucesso. Pipeline completo finalizado.`);
+        return { success: true, logs: serverLogs };
+
+    } catch (err) {
+        log(`Erro no pipeline: ${err.message}`);
+        log(err.stack);
+        return { success: false, logs: serverLogs, error: err };
     }
 }
 
-// Servidor HTTP simples para servir a página HTML
+// ---------- FUNÇÃO: PROCV-ONLY (le elegiveis_auto.xlsx e gera relatorio_final.xlsx) ----------
+function runProcvOnly() {
+    serverLogs = [];
+    try {
+        log('Iniciando PROCV-only (ler elegiveis_auto.xlsx -> gerar relatorio_final.xlsx)...');
+
+        if (!fs.existsSync(ARQUIVO_ELEGIVEIS)) {
+            log(`Arquivo ${ARQUIVO_ELEGIVEIS} não encontrado. Abortando PROCV-only.`);
+            return { success: false, logs: serverLogs };
+        }
+
+        const wb = xlsx.readFile(ARQUIVO_ELEGIVEIS);
+        const wsPrincipal = wb.Sheets[NOME_PLANILHA_PRINCIPAL] || wb.Sheets[wb.SheetNames[0]];
+        const wsRelacionamento = wb.Sheets[NOME_PLANILHA_RELACIONAMENTO] || wb.Sheets[Object.keys(wb.Sheets).find(n => n.toLowerCase().includes('relacion'))];
+        const wsSupervisor = wb.Sheets[NOME_PLANILHA_SUPERVISORES] || wb.Sheets[Object.keys(wb.Sheets).find(n => n.toLowerCase().includes('supervis'))];
+
+        if (!wsPrincipal) {
+            log(`Planilha principal "${NOME_PLANILHA_PRINCIPAL}" não encontrada em ${ARQUIVO_ELEGIVEIS}. Abortando.`);
+            return { success: false, logs: serverLogs };
+        }
+        if (!wsRelacionamento) {
+            log(`Planilha relacionamento não encontrada em ${ARQUIVO_ELEGIVEIS}. Abortando.`);
+            return { success: false, logs: serverLogs };
+        }
+        if (!wsSupervisor) {
+            log(`Planilha supervisor não encontrada em ${ARQUIVO_ELEGIVEIS}. Abortando.`);
+            return { success: false, logs: serverLogs };
+        }
+
+        // Ler como JSON (usa cabeçalhos)
+        const dadosPrincipal = xlsx.utils.sheet_to_json(wsPrincipal, { defval: '' });
+        const dadosRelacionamento = xlsx.utils.sheet_to_json(wsRelacionamento, { defval: '' });
+        const dadosSupervisor = xlsx.utils.sheet_to_json(wsSupervisor, { defval: '' });
+
+        // Montar mapas (com normalização)
+        const mapaRelacionamento = new Map();
+        for (const linha of dadosRelacionamento) {
+            // tenta detectar o nome da coluna CNPJ independentemente do case
+            const keys = Object.keys(linha);
+            const keyCnpj = keys.find(k => k && k.toUpperCase().includes('CNPJ')) || keys[0];
+            const keyFase = keys.find(k => k && k.toUpperCase().includes('FASE')) || keys[1];
+            const keyResponsavel = keys.find(k => k && k.toUpperCase().includes('RESPONS')) || keys[2];
+
+            const cnpj = linha[keyCnpj];
+            const fase = linha[keyFase];
+            const responsavel = linha[keyResponsavel];
+
+            if (cnpj) {
+                mapaRelacionamento.set(normCnpjKey(cnpj), { fase: norm(fase), responsavel: norm(responsavel) });
+            }
+        }
+
+        const mapaSupervisor = new Map();
+        for (const linha of dadosSupervisor) {
+            const keys = Object.keys(linha);
+            const keyCons = keys.find(k => k && k.toUpperCase().includes('CONSULT')) || keys[0];
+            const keyEquipe = keys.find(k => k && k.toUpperCase().includes('EQUIPE')) || keys[1];
+            const consultor = linha[keyCons];
+            const equipe = linha[keyEquipe];
+            if (consultor) mapaSupervisor.set(normKey(consultor), norm(equipe));
+        }
+
+        log('Mapas do PROCV-only criados.');
+
+        // Processar cada linha principal e adicionar campos
+        const resultadoFinal = [];
+        let notFoundCnpj = 0;
+        let notFoundSupervisor = 0;
+
+        for (const linha of dadosPrincipal) {
+            // detectar campo cnpj na linha
+            const keys = Object.keys(linha);
+            const keyCnpj = keys.find(k => k && k.toUpperCase().includes('CNPJ')) || keys[0];
+            const rawCnpj = linha[keyCnpj];
+
+            let fase = 'Não encontrado';
+            let responsavel = 'Não encontrado';
+            let supervisor = 'Não encontrado';
+
+            if (rawCnpj) {
+                const cnpjKey = normCnpjKey(rawCnpj);
+                if (mapaRelacionamento.has(cnpjKey)) {
+                    const dadosRel = mapaRelacionamento.get(cnpjKey);
+                    fase = dadosRel.fase || 'Não encontrado';
+                    responsavel = dadosRel.responsavel || 'Não encontrado';
+                } else {
+                    notFoundCnpj++;
+                }
+            } else {
+                notFoundCnpj++;
+            }
+
+            if (responsavel !== 'Não encontrado' && mapaSupervisor.has(normKey(responsavel))) {
+                supervisor = mapaSupervisor.get(normKey(responsavel)) || 'Não encontrado';
+            } else {
+                if (responsavel !== 'Não encontrado') notFoundSupervisor++;
+            }
+
+            // adiciona sem sobrescrever campos originais
+            resultadoFinal.push({
+                ...linha,
+                'fase': fase,
+                'responsavel': responsavel,
+                'supervisor': supervisor
+            });
+        }
+
+        log(`PROCV-only: CNPJs não encontrados: ${notFoundCnpj}. Responsáveis sem supervisor: ${notFoundSupervisor}.`);
+
+        // Criar nova planilha/arquivo de saída
+        const novaWs = xlsx.utils.json_to_sheet(resultadoFinal);
+        const novoWb = xlsx.utils.book_new();
+        xlsx.utils.book_append_sheet(novoWb, novaWs, 'Resultado');
+        xlsx.writeFile(novoWb, ARQUIVO_SAIDA_PROCV);
+
+        log(`Arquivo ${ARQUIVO_SAIDA_PROCV} criado com sucesso.`);
+        return { success: true, logs: serverLogs };
+
+    } catch (err) {
+        log(`Erro no PROCV-only: ${err.message}`);
+        log(err.stack);
+        return { success: false, logs: serverLogs, error: err };
+    }
+}
+
+// ---------- HTTP SERVER (rota simples + logs) ----------
 const server = http.createServer((req, res) => {
     if (req.method === 'POST' && req.url === '/run') {
-        serverLogs = []; // Limpa os logs antigos a cada nova execução
-        runAutomation(); //
+        // Executa pipeline completo
+        const result = runFullPipeline();
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ message: 'Processo concluído.', logs: serverLogs })); // Envia todos os logs para o cliente
-    } else {
-        fs.readFile(path.join(__dirname, 'index.html'), (err, data) => {
-            if (err) {
-                res.writeHead(500);
-                res.end('Erro ao carregar index.html');
-                return;
-            }
-            res.writeHead(200, { 'Content-Type': 'text/html' });
-            res.end(data);
-        });
+        res.end(JSON.stringify({ message: 'Pipeline executado', result }));
+        return;
     }
+
+    if (req.method === 'GET' && req.url === '/logs') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ logs: serverLogs }));
+        return;
+    }
+
+    // Página simples para acionar o /run via form
+    if (req.method === 'GET' && req.url === '/') {
+        const html = `
+            <html>
+                <head><meta charset="utf-8"><title>Automação XLSX</title></head>
+                <body>
+                    <h2>Automação XLSX</h2>
+                    <p>POST <code>/run</code> para executar o pipeline completo.</p>
+                    <form method="post" action="/run">
+                        <button type="submit">Executar pipeline completo</button>
+                    </form>
+                    <p>GET <code>/logs</code> para ver logs da última execução.</p>
+                </body>
+            </html>
+        `;
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+        return;
+    }
+
+    res.writeHead(404);
+    res.end('Not Found');
 });
 
-const PORT = 3000;
-server.listen(PORT, () => {
-    console.log(`Servidor rodando em http://localhost:${PORT}`);
-    console.log('Coloque os arquivos .xlsx na mesma pasta deste script.');
-    console.log('Abra o navegador e acesse a URL acima para iniciar.');
-});
+// Se executado diretamente (CLI), decide que fluxo executar com base nos arquivos presentes.
+if (require.main === module) {
+    // Se tiver parametro de CLI "procv" -> roda PROCV-only
+    const cliArg = process.argv[2];
+    if (cliArg && (cliArg.toLowerCase() === 'procv' || cliArg.toLowerCase() === 'procv-only')) {
+        const r = runProcvOnly();
+        console.log('PROCV-only finalizado. Logs:');
+        console.log(r.logs.join('\n'));
+        process.exit(r.success ? 0 : 1);
+    }
+
+    // Se existir elegiveis_auto.xlsx -> por padrão executa PROCV-only
+    if (fs.existsSync(ARQUIVO_ELEGIVEIS) && !checkRequiredFilesForPipeline()) {
+        const r = runProcvOnly();
+        console.log('Executado PROCV-only (detecção automática). Logs:');
+        console.log(r.logs.join('\n'));
+        process.exit(r.success ? 0 : 1);
+    }
+
+    // Caso contrário, tenta executar o pipeline completo localmente (se arquivos estiverem presentes)
+    if (checkRequiredFilesForPipeline()) {
+        const r = runFullPipeline();
+        console.log('Pipeline completo finalizado. Logs:');
+        console.log(r.logs.join('\n'));
+        process.exit(r.success ? 0 : 1);
+    }
+
+    // Se nenhum dos cenários aplicou, inicializa o servidor HTTP e aguarda POST /run
+    const PORT = 3000;
+    server.listen(PORT, () => {
+        console.log(`Servidor rodando em http://localhost:${PORT}`);
+        console.log('Coloque os arquivos .xlsx na mesma pasta e acesse o servidor para executar o pipeline.');
+    });
+}
