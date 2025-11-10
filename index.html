@@ -7,48 +7,121 @@
     <style>
         body { font-family: sans-serif; background-color: #f4f4f4; color: #333; padding: 20px; }
         h1 { color: #0056b3; }
-        #container { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        #container { max-width: 800px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
         button { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
         button:hover { background-color: #0056b3; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
         #logs { margin-top: 20px; background-color: #eee; border: 1px solid #ddd; padding: 10px; height: 300px; overflow-y: scroll; font-family: monospace; white-space: pre-wrap; }
+        .file-upload { margin-bottom: 15px; }
+        .file-upload label { font-weight: bold; display: block; margin-bottom: 5px; }
+        .file-upload input { width: 100%; padding: 8px; box-sizing: border-box; }
+        .error { color: red; font-weight: bold; }
+        .success { color: green; font-weight: bold; }
     </style>
 </head>
 <body>
     <div id="container">
         <h1>Automação de Planilhas</h1>
         <p>
-            Certifique-se de que os seguintes arquivos estão na mesma pasta que o servidor:
-            <code>relatorio.xlsx</code>, <code>baixada_do_bitrix.xlsx</code>, <code>time_novembro.xlsx</code>.
+            Por favor, selecione os quatro arquivos Excel necessários para o processamento.
         </p>
-        <button onclick="startProcess()">Iniciar Processo</button>
-        <h2>Logs do Processo (no console do servidor)</h2>
+
+        <div class="file-upload">
+            <label for="relatorio">1. Arquivo de Relatório Principal:</label>
+            <input type="file" id="relatorio" name="relatorio" accept=".xlsx, .xls">
+        </div>
+
+        <div class="file-upload">
+            <label for="bitrix">2. Arquivo do Bitrix (Relacionamento):</label>
+            <input type="file" id="bitrix" name="bitrix" accept=".xlsx, .xls">
+        </div>
+
+        <div class="file-upload">
+            <label for="time">3. Arquivo de Time (Supervisores):</label>
+            <input type="file" id="time" name="time" accept=".xlsx, .xls">
+        </div>
+
+        <div class="file-upload">
+            <label for="contatos">4. Arquivo Contatos Bitrix (Faturamento):</label>
+            <input type="file" id="contatos" name="contatos" accept=".xlsx, .xls">
+        </div>
+
+        <button id="process-btn" onclick="startProcess()">Iniciar Processo</button>
+        
+        <h2>Logs do Processo</h2>
         <div id="logs">
-            Os logs detalhados aparecerão no terminal onde você iniciou o 'server.js'.<br>
-            Esta área é apenas para feedback visual.
+            Aguardando o início do processo...
         </div>
     </div>
 
     <script>
         const logDiv = document.getElementById('logs');
+        const processBtn = document.getElementById('process-btn');
 
-        function logToPage(message) {
-            logDiv.innerHTML += message + '<br>';
+        function logToPage(message, type = '') {
+            const line = document.createElement('div');
+            // Usar textContent é mais seguro para evitar injeção de HTML
+            line.innerHTML = message;
+            if (type) {
+                line.classList.add(type);
+            }
+            logDiv.appendChild(line);
             logDiv.scrollTop = logDiv.scrollHeight;
         }
 
         async function startProcess() {
-            logToPage('Enviando requisição para iniciar o processo...');
+            console.log("Botão 'Iniciar Processo' clicado. A função startProcess() foi chamada.");
+
+            const relatorioFile = document.getElementById('relatorio').files[0];
+            const bitrixFile = document.getElementById('bitrix').files[0];
+            const timeFile = document.getElementById('time').files[0];
+            const contatosFile = document.getElementById('contatos').files[0];
+
+            if (!relatorioFile || !bitrixFile || !timeFile || !contatosFile) {
+                logToPage('Erro: Por favor, selecione todos os quatro arquivos antes de iniciar.', 'error');
+                return;
+            }
+
+            logDiv.innerHTML = ''; // Limpa logs antigos
+            logToPage('Iniciando... Validando e enviando arquivos para o servidor.');
+            processBtn.disabled = true;
+            processBtn.innerText = 'Processando...';
+
+            const formData = new FormData();
+            formData.append('relatorio', relatorioFile);
+            formData.append('bitrix', bitrixFile);
+            formData.append('time', timeFile);
+            formData.append('contatos', contatosFile);
+
             try {
-                const response = await fetch('/run', { method: 'POST' });
-                const result = await response.json(); //
-                logToPage('--- Resposta do Servidor ---'); //
-                if (result.logs && result.logs.length > 0) { //
-                    result.logs.forEach(logMsg => logToPage(logMsg)); //
-                } //
-                logToPage('---------------------------'); //
-                logToPage('<b>' + result.message + ' Verifique o arquivo "elegiveis_auto.xlsx".</b>'); //
+                console.log("Enviando requisição fetch para /run...");
+                const response = await fetch('/run', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+                logToPage('--- Resposta do Servidor ---');
+                console.log("Resposta recebida do servidor:", result);
+
+                if (result.logs && result.logs.length > 0) {
+                    result.logs.forEach(logMsg => logToPage(logMsg.replace(/\[.*?\]\s/, ''))); // Remove o timestamp para uma visualização mais limpa
+                }
+                logToPage('---------------------------');
+
+                if (response.ok) {
+                    logToPage('<b>' + result.message + '</b> O arquivo "elegiveis_auto.xlsx" foi gerado na pasta do servidor.', 'success');
+                } else {
+                    logToPage('<b>Falha no processo:</b> ' + result.message, 'error');
+                }
+
             } catch (error) {
-                logToPage('Erro ao se comunicar com o servidor: ' + error.message);
+                console.error("Erro na requisição fetch:", error);
+                logToPage('<b>Erro de comunicação com o servidor:</b> ' + error.message, 'error');
+            } finally {
+                console.log("Processo finalizado (com sucesso ou erro). Habilitando botão.");
+                processBtn.disabled = false;
+                processBtn.innerText = 'Iniciar Processo';
             }
         }
     </script>

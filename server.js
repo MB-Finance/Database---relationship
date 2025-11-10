@@ -1,28 +1,25 @@
-/**
- * app.js
- *
- * Script unificado:
- * - Roda como servidor HTTP (porta 3000). POST /run -> executa pipeline completo (ler relatorio.xlsx, bitrix, time, gerar elegiveis_auto.xlsx).
- * - Também oferece modo "procv-only" (se existir elegiveis_auto.xlsx ele gera relatorio_final.xlsx) quando executado diretamente (node app.js).
- *
- * Dependências:
- *   npm install xlsx
- *
- * Coloque os arquivos na mesma pasta:
- *   - relatorio.xlsx
- *   - baixada_do_bitrix.xlsx
- *   - time_novembro.xlsx
- *   (ou apenas elegiveis_auto.xlsx caso queira só o passo PROCV-only)
- *
- * Execução:
- *   node app.js        -> roda em modo CLI: se achar elegiveis_auto.xlsx executa PROCV-only; senão executa pipeline completo (se tiver os arquivos).
- *   Start server: node app.js && abrir http://localhost:3000 e clicar/run POST -> chama pipeline completo.
- */
-
-const http = require('http');
+const express = require('express');
+const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const xlsx = require('xlsx');
+
+const app = express();
+const PORT = 3000;
+
+// Configuração do Multer para fazer upload dos arquivos em memória (como buffers)
+const storage = multer.memoryStorage();
+const upload = multer({
+    storage: storage,
+    fileFilter: (req, file, cb) => {
+        // Aceita apenas arquivos excel
+        if (file.mimetype.includes('excel') || file.mimetype.includes('spreadsheetml')) {
+            cb(null, true);
+        } else {
+            cb(new Error('Apenas arquivos .xlsx, .xls são permitidos!'), false);
+        }
+    }
+});
 
 // ---------- CONFIGURAÇÃO DE ARQUIVOS ----------
 const ARQUIVO_RELATORIO = 'relatorio.xlsx';
@@ -50,31 +47,23 @@ const normKey = v => norm(v).toUpperCase();
 const normCnpjKey = v => norm(v).replace(/\D/g, ''); // mantém só números
 
 // ---------- FUNÇÃO: CHECAR EXISTÊNCIA ARQUIVOS (para pipeline completo) ----------
-function checkRequiredFilesForPipeline() {
-    const files = [ARQUIVO_RELATORIO, ARQUIVO_BITRIX, ARQUIVO_TIME];
-    for (const f of files) {
-        if (!fs.existsSync(f)) {
-            log(`Arquivo necessário não encontrado: ${f}`);
-            return false;
-        }
-    }
-    return true;
-}
+
 
 // ---------- FUNÇÃO: PIPELINE COMPLETO (gera elegiveis_auto.xlsx com colunas preenchidas) ----------
-function runFullPipeline() {
+function runFullPipeline(fileBuffers) {
     serverLogs = []; // reset logs para execução
     try {
         log('Iniciando pipeline completo...');
 
-        if (!checkRequiredFilesForPipeline()) {
-            log('Faltam arquivos para executar o pipeline completo. Abortando pipeline.');
-            return { success: false, logs: serverLogs };
-        }
+        // --- Ler arquivos a partir dos buffers recebidos via upload ---
+        const relatorioBuffer = fileBuffers.relatorio[0].buffer;
+        const bitrixBuffer = fileBuffers.bitrix[0].buffer;
+        const timeBuffer = fileBuffers.time[0].buffer;
+        const contatosBuffer = fileBuffers.contatos[0].buffer;
 
         // --- Ler relatorio.xlsx ---
-        log(`Lendo ${ARQUIVO_RELATORIO}...`);
-        const relWb = xlsx.readFile(ARQUIVO_RELATORIO);
+        log(`Lendo buffer do arquivo de relatório...`);
+        const relWb = xlsx.read(relatorioBuffer);
         const relFirstSheet = relWb.Sheets[relWb.SheetNames[0]];
         const relDataAoA = xlsx.utils.sheet_to_json(relFirstSheet, { header: 1, defval: null });
 
@@ -98,6 +87,7 @@ function runFullPipeline() {
         headerRow[2] = 'fase';
         headerRow[3] = 'responsavel';
         headerRow[4] = 'Supervisor';
+        headerRow[5] = 'faturamento';
         // se quiser manter outros cabeçalhos, não mexa; já renomeamos essas 3
 
         // --- Montar workbook inicial 'elegiveis_auto' em memória com a planilha principal ---
@@ -107,8 +97,8 @@ function runFullPipeline() {
         log('Planilha principal criada em memória.');
 
         // --- Ler Bitrix --- (extraindo CNPJ (coluna H), Fase (B), Responsável (E))
-        log(`Lendo ${ARQUIVO_BITRIX} (Bitrix)...`);
-        const bitrixWb = xlsx.readFile(ARQUIVO_BITRIX);
+        log(`Lendo buffer do arquivo Bitrix...`);
+        const bitrixWb = xlsx.read(bitrixBuffer);
         const bitrixWs = bitrixWb.Sheets[bitrixWb.SheetNames[0]];
         const bitrixDataAoA = xlsx.utils.sheet_to_json(bitrixWs, { header: 1, defval: null });
 
@@ -134,8 +124,8 @@ function runFullPipeline() {
         log(`Planilha "${NOME_PLANILHA_RELACIONAMENTO}" adicionada (dados do Bitrix).`);
 
         // --- Ler Arquivo TIME (supervisores) ---
-        log(`Lendo ${ARQUIVO_TIME} (time)...`);
-        const timeWb = xlsx.readFile(ARQUIVO_TIME);
+        log(`Lendo buffer do arquivo de time...`);
+        const timeWb = xlsx.read(timeBuffer);
         const timeWs = timeWb.Sheets[timeWb.SheetNames[0]];
         // lê como JSON (primeira linha cabeçalho)
         const timeDataJson = xlsx.utils.sheet_to_json(timeWs, { defval: '' });
@@ -153,6 +143,24 @@ function runFullPipeline() {
         const supervisoresWs = xlsx.utils.aoa_to_sheet(supervisoresRows);
         xlsx.utils.book_append_sheet(elegiveisWb, supervisoresWs, NOME_PLANILHA_SUPERVISORES);
         log(`Planilha "${NOME_PLANILHA_SUPERVISORES}" adicionada (dados de time).`);
+
+        // --- Ler Arquivo CONTATOSBITRIX (faturamento) ---
+        log(`Lendo buffer do arquivo CONTATOSBITRIX...`);
+        const contatosWb = xlsx.read(contatosBuffer);
+        const contatosWs = contatosWb.Sheets[contatosWb.SheetNames[0]];
+        const contatosDataJson = xlsx.utils.sheet_to_json(contatosWs, { defval: '' });
+
+        // Montar mapa para faturamento (CNPJ -> Faturamento)
+        const mapFaturamento = {};
+        const contatosHeaders = Object.keys(contatosDataJson[0] || {});
+        const hCnpjContatos = contatosHeaders.find(h => h && h.toUpperCase().includes('CNPJ')) || contatosHeaders[0];
+        const hFaturamento = contatosHeaders[1]; // Coluna B
+
+        for (const row of contatosDataJson) {
+            const cnpjKey = normCnpjKey(row[hCnpjContatos]);
+            if (cnpjKey) mapFaturamento[cnpjKey] = row[hFaturamento];
+        }
+        log('Mapa de faturamento criado.');
 
         // --- Converter a planilha principal (com as 4 colunas em branco) em JSON para filtrar conforme regras ---
         log('Convertendo planilha principal para JSON para aplicar filtros...');
@@ -242,6 +250,7 @@ function runFullPipeline() {
         log('Executando lookups e preenchendo colunas nas linhas filtradas...');
         let countCnpjNotFound = 0;
         let countRespNotFound = 0;
+        let countFaturamentoNotFound = 0;
         const dadosComLookups = dadosFiltrados.map((row) => {
             // A suposição: coluna CNPJ em seu relatorio original pode variar; vamos procurar
             // possíveis chave 'CNPJ' (maiúsc/minúsc) no objeto row
@@ -258,6 +267,7 @@ function runFullPipeline() {
             let fase = 'Não encontrado';
             let responsavel = 'Não encontrado';
             let supervisor = 'Não encontrado';
+            let faturamento = 'Não encontrado';
 
             if (cnpjKey && mapBitrix[cnpjKey]) {
                 fase = mapBitrix[cnpjKey].fase || 'Não encontrado';
@@ -274,16 +284,24 @@ function runFullPipeline() {
                 if (responsavel !== 'Não encontrado') countRespNotFound++;
             }
 
+            // lookup do faturamento
+            if (cnpjKey && mapFaturamento[cnpjKey] !== undefined) {
+                faturamento = mapFaturamento[cnpjKey];
+            } else {
+                countFaturamentoNotFound++;
+            }
+
             // Retornar novo objeto com as colunas adicionadas (mantendo todas as colunas originais)
             return {
                 ...row,
                 'fase': fase,
                 'responsavel': responsavel,
-                'Supervisor': supervisor
+                'Supervisor': supervisor,
+                'faturamento': faturamento
             };
         });
 
-        log(`Lookups concluídos. CNPJs não encontrados: ${countCnpjNotFound}. Responsáveis (consultor) sem supervisor: ${countRespNotFound}.`);
+        log(`Lookups concluídos. CNPJs não encontrados (fase/resp): ${countCnpjNotFound}. Responsáveis sem supervisor: ${countRespNotFound}. CNPJs sem faturamento: ${countFaturamentoNotFound}.`);
 
         // --- Converter dadosComLookups para sheet (inclui cabeçalho) e salvar no arquivo elegiveis_auto.xlsx ---
         log(`Salvando arquivo ${ARQUIVO_ELEGIVEIS} com dados preenchidos...`);
@@ -304,202 +322,47 @@ function runFullPipeline() {
     }
 }
 
-// ---------- FUNÇÃO: PROCV-ONLY (le elegiveis_auto.xlsx e gera relatorio_final.xlsx) ----------
-function runProcvOnly() {
-    serverLogs = [];
-    try {
-        log('Iniciando PROCV-only (ler elegiveis_auto.xlsx -> gerar relatorio_final.xlsx)...');
+// ---------- ROTAS DO SERVIDOR EXPRESS ----------
 
-        if (!fs.existsSync(ARQUIVO_ELEGIVEIS)) {
-            log(`Arquivo ${ARQUIVO_ELEGIVEIS} não encontrado. Abortando PROCV-only.`);
-            return { success: false, logs: serverLogs };
-        }
-
-        const wb = xlsx.readFile(ARQUIVO_ELEGIVEIS);
-        const wsPrincipal = wb.Sheets[NOME_PLANILHA_PRINCIPAL] || wb.Sheets[wb.SheetNames[0]];
-        const wsRelacionamento = wb.Sheets[NOME_PLANILHA_RELACIONAMENTO] || wb.Sheets[Object.keys(wb.Sheets).find(n => n.toLowerCase().includes('relacion'))];
-        const wsSupervisor = wb.Sheets[NOME_PLANILHA_SUPERVISORES] || wb.Sheets[Object.keys(wb.Sheets).find(n => n.toLowerCase().includes('supervis'))];
-
-        if (!wsPrincipal) {
-            log(`Planilha principal "${NOME_PLANILHA_PRINCIPAL}" não encontrada em ${ARQUIVO_ELEGIVEIS}. Abortando.`);
-            return { success: false, logs: serverLogs };
-        }
-        if (!wsRelacionamento) {
-            log(`Planilha relacionamento não encontrada em ${ARQUIVO_ELEGIVEIS}. Abortando.`);
-            return { success: false, logs: serverLogs };
-        }
-        if (!wsSupervisor) {
-            log(`Planilha supervisor não encontrada em ${ARQUIVO_ELEGIVEIS}. Abortando.`);
-            return { success: false, logs: serverLogs };
-        }
-
-        // Ler como JSON (usa cabeçalhos)
-        const dadosPrincipal = xlsx.utils.sheet_to_json(wsPrincipal, { defval: '' });
-        const dadosRelacionamento = xlsx.utils.sheet_to_json(wsRelacionamento, { defval: '' });
-        const dadosSupervisor = xlsx.utils.sheet_to_json(wsSupervisor, { defval: '' });
-
-        // Montar mapas (com normalização)
-        const mapaRelacionamento = new Map();
-        for (const linha of dadosRelacionamento) {
-            // tenta detectar o nome da coluna CNPJ independentemente do case
-            const keys = Object.keys(linha);
-            const keyCnpj = keys.find(k => k && k.toUpperCase().includes('CNPJ')) || keys[0];
-            const keyFase = keys.find(k => k && k.toUpperCase().includes('FASE')) || keys[1];
-            const keyResponsavel = keys.find(k => k && k.toUpperCase().includes('RESPONS')) || keys[2];
-
-            const cnpj = linha[keyCnpj];
-            const fase = linha[keyFase];
-            const responsavel = linha[keyResponsavel];
-
-            if (cnpj) {
-                mapaRelacionamento.set(normCnpjKey(cnpj), { fase: norm(fase), responsavel: norm(responsavel) });
-            }
-        }
-
-        const mapaSupervisor = new Map();
-        for (const linha of dadosSupervisor) {
-            const keys = Object.keys(linha);
-            const keyCons = keys.find(k => k && k.toUpperCase().includes('CONSULT')) || keys[0];
-            const keyEquipe = keys.find(k => k && k.toUpperCase().includes('EQUIPE')) || keys[1];
-            const consultor = linha[keyCons];
-            const equipe = linha[keyEquipe];
-            if (consultor) mapaSupervisor.set(normKey(consultor), norm(equipe));
-        }
-
-        log('Mapas do PROCV-only criados.');
-
-        // Processar cada linha principal e adicionar campos
-        const resultadoFinal = [];
-        let notFoundCnpj = 0;
-        let notFoundSupervisor = 0;
-
-        for (const linha of dadosPrincipal) {
-            // detectar campo cnpj na linha
-            const keys = Object.keys(linha);
-            const keyCnpj = keys.find(k => k && k.toUpperCase().includes('CNPJ')) || keys[0];
-            const rawCnpj = linha[keyCnpj];
-
-            let fase = 'Não encontrado';
-            let responsavel = 'Não encontrado';
-            let supervisor = 'Não encontrado';
-
-            if (rawCnpj) {
-                const cnpjKey = normCnpjKey(rawCnpj);
-                if (mapaRelacionamento.has(cnpjKey)) {
-                    const dadosRel = mapaRelacionamento.get(cnpjKey);
-                    fase = dadosRel.fase || 'Não encontrado';
-                    responsavel = dadosRel.responsavel || 'Não encontrado';
-                } else {
-                    notFoundCnpj++;
-                }
-            } else {
-                notFoundCnpj++;
-            }
-
-            if (responsavel !== 'Não encontrado' && mapaSupervisor.has(normKey(responsavel))) {
-                supervisor = mapaSupervisor.get(normKey(responsavel)) || 'Não encontrado';
-            } else {
-                if (responsavel !== 'Não encontrado') notFoundSupervisor++;
-            }
-
-            // adiciona sem sobrescrever campos originais
-            resultadoFinal.push({
-                ...linha,
-                'fase': fase,
-                'responsavel': responsavel,
-                'supervisor': supervisor
-            });
-        }
-
-        log(`PROCV-only: CNPJs não encontrados: ${notFoundCnpj}. Responsáveis sem supervisor: ${notFoundSupervisor}.`);
-
-        // Criar nova planilha/arquivo de saída
-        const novaWs = xlsx.utils.json_to_sheet(resultadoFinal);
-        const novoWb = xlsx.utils.book_new();
-        xlsx.utils.book_append_sheet(novoWb, novaWs, 'Resultado');
-        xlsx.writeFile(novoWb, ARQUIVO_SAIDA_PROCV);
-
-        log(`Arquivo ${ARQUIVO_SAIDA_PROCV} criado com sucesso.`);
-        return { success: true, logs: serverLogs };
-
-    } catch (err) {
-        log(`Erro no PROCV-only: ${err.message}`);
-        log(err.stack);
-        return { success: false, logs: serverLogs, error: err };
-    }
-}
-
-// ---------- HTTP SERVER (rota simples + logs) ----------
-const server = http.createServer((req, res) => {
-    if (req.method === 'POST' && req.url === '/run') {
-        // Executa pipeline completo
-        const result = runFullPipeline();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ message: 'Pipeline executado', result }));
-        return;
-    }
-
-    if (req.method === 'GET' && req.url === '/logs') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ logs: serverLogs }));
-        return;
-    }
-
-    // Página simples para acionar o /run via form
-    if (req.method === 'GET' && req.url === '/') {
-        const html = `
-            <html>
-                <head><meta charset="utf-8"><title>Automação XLSX</title></head>
-                <body>
-                    <h2>Automação XLSX</h2>
-                    <p>POST <code>/run</code> para executar o pipeline completo.</p>
-                    <form method="post" action="/run">
-                        <button type="submit">Executar pipeline completo</button>
-                    </form>
-                    <p>GET <code>/logs</code> para ver logs da última execução.</p>
-                </body>
-            </html>
-        `;
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(html);
-        return;
-    }
-
-    res.writeHead(404);
-    res.end('Not Found');
+// Servir a página HTML principal
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// Se executado diretamente (CLI), decide que fluxo executar com base nos arquivos presentes.
-if (require.main === module) {
-    // Se tiver parametro de CLI "procv" -> roda PROCV-only
-    const cliArg = process.argv[2];
-    if (cliArg && (cliArg.toLowerCase() === 'procv' || cliArg.toLowerCase() === 'procv-only')) {
-        const r = runProcvOnly();
-        console.log('PROCV-only finalizado. Logs:');
-        console.log(r.logs.join('\n'));
-        process.exit(r.success ? 0 : 1);
+// Rota para executar o pipeline, agora recebendo os arquivos
+app.post('/run', upload.fields([
+    { name: 'relatorio', maxCount: 1 },
+    { name: 'bitrix', maxCount: 1 },
+    { name: 'time', maxCount: 1 },
+    { name: 'contatos', maxCount: 1 }
+]), (req, res) => {
+
+    if (!req.files || !req.files.relatorio || !req.files.bitrix || !req.files.time) {
+        return res.status(400).json({
+            message: 'Erro: Todos os três arquivos são obrigatórios.',
+            logs: ['Requisição recebida, mas um ou mais arquivos não foram enviados.']
+        });
     }
 
-    // Se existir elegiveis_auto.xlsx -> por padrão executa PROCV-only
-    if (fs.existsSync(ARQUIVO_ELEGIVEIS) && !checkRequiredFilesForPipeline()) {
-        const r = runProcvOnly();
-        console.log('Executado PROCV-only (detecção automática). Logs:');
-        console.log(r.logs.join('\n'));
-        process.exit(r.success ? 0 : 1);
-    }
+    // Os arquivos estão em req.files e seus buffers em req.files.<fieldname>[0].buffer
+    const result = runFullPipeline(req.files);
 
-    // Caso contrário, tenta executar o pipeline completo localmente (se arquivos estiverem presentes)
-    if (checkRequiredFilesForPipeline()) {
-        const r = runFullPipeline();
-        console.log('Pipeline completo finalizado. Logs:');
-        console.log(r.logs.join('\n'));
-        process.exit(r.success ? 0 : 1);
+    if (result.success) {
+        res.status(200).json({
+            message: 'Pipeline executado com sucesso!',
+            logs: result.logs
+        });
+    } else {
+        res.status(500).json({
+            message: 'Ocorreu um erro durante a execução do pipeline.',
+            logs: result.logs,
+            error: result.error ? result.error.message : 'Erro desconhecido'
+        });
     }
+});
 
-    // Se nenhum dos cenários aplicou, inicializa o servidor HTTP e aguarda POST /run
-    const PORT = 3000;
-    server.listen(PORT, () => {
-        console.log(`Servidor rodando em http://localhost:${PORT}`);
-        console.log('Coloque os arquivos .xlsx na mesma pasta e acesse o servidor para executar o pipeline.');
-    });
-}
+// ---------- INICIALIZAÇÃO DO SERVIDOR ----------
+app.listen(PORT, () => {
+    console.log(`Servidor rodando em http://localhost:${PORT}`);
+    console.log('Acesse a página no navegador para fazer o upload dos arquivos e executar o processo.');
+});
