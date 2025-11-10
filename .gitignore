@@ -1,2 +1,25 @@
+# Dependency directories
+# Esta pasta contém todos os pacotes de terceiros e pode ser muito grande.
+# Ela é recriada executando "npm install".
+node_modules/
+
+# Log files
+*.log
+npm-debug.log*
+
+# Arquivos de sistema operacional
+.DS_Store
+Thumbs.db
+
+# Arquivos de dados, temporários e de saída
+# Ignora todos os arquivos Excel para não versionar dados brutos ou resultados.
 *.xls
 *.xlsx
+
+# Lista explícita dos principais arquivos de entrada e saída para maior clareza,
+# mesmo que já estejam cobertos pela regra "*.xlsx".
+relatorio.xlsx
+baixada_do_bitrix.xlsx
+time_novembro.xlsx
+elegiveis_auto.xlsx
+relatorio_final.xlsx
